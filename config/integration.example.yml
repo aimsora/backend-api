@@ -1,0 +1,12 @@
+services:
+  graphql:
+    path: /graphql
+  queue:
+    source_raw: source.raw.v1
+    source_normalized: source.normalized.v1
+  contracts_repo:
+    local_path: ../shared-contracts
+dependencies:
+  postgres: postgresql://app:app@postgres:5432/procurement
+  redis: redis://redis:6379
+  rabbitmq: amqp://app:app@rabbitmq:5672
