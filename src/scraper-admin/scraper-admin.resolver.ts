@@ -4,6 +4,7 @@ import { Roles } from "../common/decorators/roles.decorator";
 import {
   ScraperAdminConfig,
   ScraperAdminOverview,
+  UpdateScraperAdminSourceStateInput,
   UpdateScraperAdminConfigInput
 } from "./scraper-admin.models";
 import { ScraperAdminService } from "./scraper-admin.service";
@@ -24,5 +25,13 @@ export class ScraperAdminResolver {
     @Args("input") input: UpdateScraperAdminConfigInput
   ) {
     return this.scraperAdminService.updateConfig(input);
+  }
+
+  @Roles(UserRole.ADMIN)
+  @Mutation(() => ScraperAdminConfig)
+  updateScraperAdminSourceState(
+    @Args("input") input: UpdateScraperAdminSourceStateInput
+  ) {
+    return this.scraperAdminService.updateSourceState(input);
   }
 }

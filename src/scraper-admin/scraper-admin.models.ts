@@ -13,6 +13,9 @@ export class ScraperAdminConfig {
   @Field()
   autoRunEnabled!: boolean;
 
+  @Field(() => [String])
+  enabledSources!: string[];
+
   @Field(() => Date)
   updatedAt!: Date;
 
@@ -52,6 +55,9 @@ export class ScraperRuntimeState {
   @Field(() => [String])
   loadedSources!: string[];
 
+  @Field(() => [String])
+  enabledSources!: string[];
+
   @Field(() => [ScraperRuntimeCircuitState])
   circuitStates!: ScraperRuntimeCircuitState[];
 
@@ -69,6 +75,9 @@ export class ScraperAdminSourceStatus {
 
   @Field()
   isActive!: boolean;
+
+  @Field()
+  isLoaded!: boolean;
 
   @Field(() => SourceRunStatus, { nullable: true })
   lastRunStatus?: SourceRunStatus | null;
@@ -138,4 +147,20 @@ export class UpdateScraperAdminConfigInput {
   @Field()
   @IsBoolean()
   autoRunEnabled!: boolean;
+
+  @Field(() => [String], { nullable: true })
+  @IsOptional()
+  enabledSources?: string[];
+}
+
+@InputType()
+export class UpdateScraperAdminSourceStateInput {
+  @Field()
+  @IsString()
+  @MinLength(2)
+  sourceCode!: string;
+
+  @Field()
+  @IsBoolean()
+  isActive!: boolean;
 }

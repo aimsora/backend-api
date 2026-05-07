@@ -19,6 +19,7 @@ describe("ScraperAdminService", () => {
           running: true,
           runningSources: ["eis"],
           loadedSources: ["eis"],
+          enabledSources: ["eis"],
           circuitStates: []
         })
       })
@@ -26,6 +27,7 @@ describe("ScraperAdminService", () => {
 
     const prisma = {
       source: {
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
         findMany: vi.fn().mockResolvedValue([
           {
             code: "eis",
@@ -46,7 +48,10 @@ describe("ScraperAdminService", () => {
       },
       systemSetting: {
         findUnique: vi.fn().mockResolvedValue(null)
-      }
+      },
+      $transaction: vi.fn().mockImplementation(async (operations: Array<Promise<unknown>>) =>
+        Promise.all(operations)
+      )
     };
     const configService = {
       get: vi.fn((key: string) => {
@@ -56,6 +61,10 @@ describe("ScraperAdminService", () => {
 
         if (key === "SCRAPE_SCHEDULE") {
           return "*/20 * * * *";
+        }
+
+        if (key === "ENABLED_SOURCES") {
+          return ["eis"];
         }
 
         return undefined;
@@ -102,6 +111,7 @@ describe("ScraperAdminService", () => {
           running: true,
           runningSources: ["eis"],
           loadedSources: ["eis"],
+          enabledSources: ["eis"],
           circuitStates: []
         })
       })
@@ -109,6 +119,7 @@ describe("ScraperAdminService", () => {
 
     const prisma = {
       source: {
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
         findMany: vi.fn().mockResolvedValue([
           {
             code: "eis",
@@ -129,7 +140,10 @@ describe("ScraperAdminService", () => {
       },
       systemSetting: {
         findUnique: vi.fn().mockResolvedValue(null)
-      }
+      },
+      $transaction: vi.fn().mockImplementation(async (operations: Array<Promise<unknown>>) =>
+        Promise.all(operations)
+      )
     };
     const configService = {
       get: vi.fn((key: string) => {
@@ -139,6 +153,10 @@ describe("ScraperAdminService", () => {
 
         if (key === "SCRAPE_SCHEDULE") {
           return "*/20 * * * *";
+        }
+
+        if (key === "ENABLED_SOURCES") {
+          return ["eis"];
         }
 
         return undefined;

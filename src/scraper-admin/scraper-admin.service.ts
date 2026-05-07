@@ -7,6 +7,7 @@ import type {
   ScraperAdminConfig,
   ScraperAdminOverview,
   ScraperRuntimeState,
+  UpdateScraperAdminSourceStateInput,
   UpdateScraperAdminConfigInput
 } from "./scraper-admin.models";
 
@@ -16,6 +17,7 @@ const RUNNING_ATTENTION_THRESHOLD_MS = 2 * 60 * 60 * 1000;
 type RuntimeConfigRecord = {
   schedule: string;
   autoRunEnabled: boolean;
+  enabledSources: string[];
 };
 
 @Injectable()
@@ -27,9 +29,11 @@ export class ScraperAdminService {
   ) {}
 
   async getOverview(): Promise<ScraperAdminOverview> {
-    const [config, runtime, analytics, sources] = await Promise.all([
-      this.getCurrentConfig(),
-      this.fetchRuntimeState(),
+    const config = await this.getCurrentConfig();
+    await this.syncSourceActivation(config.enabledSources);
+
+    const [runtime, analytics, sources] = await Promise.all([
+      this.fetchRuntimeState(config),
       this.analyticsService.summary(),
       this.prisma.source.findMany({
         where: { deletedAt: null },
@@ -46,6 +50,7 @@ export class ScraperAdminService {
     const analyticsBySource = new Map(analytics.sourceHealth.map((item) => [item.source, item]));
     const runtimeRunning = new Set(runtime.runningSources);
     const circuitBySource = new Map(runtime.circuitStates.map((item) => [item.sourceCode, item]));
+    const loadedSourceCodes = new Set(runtime.loadedSources);
 
     return {
       config,
@@ -57,6 +62,7 @@ export class ScraperAdminService {
         const lastSuccess = source.runs.find((item) => item.status === SourceRunStatus.SUCCESS);
         const circuitState = circuitBySource.get(source.code);
         const isRunning = runtimeRunning.has(source.code);
+        const isLoaded = loadedSourceCodes.has(source.code);
         const circuitOpen = Boolean(
           circuitState?.openUntil && circuitState.openUntil.getTime() > Date.now()
         );
@@ -70,7 +76,11 @@ export class ScraperAdminService {
 
         let attentionReason = "Работает стабильно";
 
-        if (!runtime.reachable) {
+        if (!source.isActive) {
+          attentionReason = "Источник исключён из сбора администратором";
+        } else if (!isLoaded) {
+          attentionReason = "Источник не загружен в текущий runtime scraper-service";
+        } else if (!runtime.reachable) {
           attentionReason = "Контур управления scraper-service недоступен";
         } else if (circuitOpen) {
           attentionReason = "Circuit breaker открыт после серии ошибок";
@@ -98,6 +108,7 @@ export class ScraperAdminService {
           sourceCode: source.code,
           sourceName: source.name,
           isActive: source.isActive,
+          isLoaded,
           lastRunStatus: lastRun?.status ?? null,
           lastRunAt: lastRun?.startedAt ?? null,
           lastSuccessAt: lastSuccess?.startedAt ?? null,
@@ -112,15 +123,16 @@ export class ScraperAdminService {
           consecutiveFailures: circuitState?.failures ?? 0,
           circuitOpenUntil: circuitState?.openUntil ?? null,
           attentionRequired:
+            source.isActive &&
+            (!isLoaded ||
             !runtime.reachable ||
-            !source.isActive ||
             !lastRun ||
             runningTooLong ||
             hasStaleRunningStatus ||
             circuitOpen ||
             lastRun.status === SourceRunStatus.FAILED ||
             lastRun.status === SourceRunStatus.PARTIAL ||
-            (health?.riskLevel ?? "STABLE") !== "STABLE",
+            (health?.riskLevel ?? "STABLE") !== "STABLE"),
           attentionReason
         };
       })
@@ -128,32 +140,37 @@ export class ScraperAdminService {
   }
 
   async updateConfig(input: UpdateScraperAdminConfigInput): Promise<ScraperAdminConfig> {
-    const applied = await this.applyRuntimeConfig(input);
-
-    const setting = await this.prisma.systemSetting.upsert({
-      where: { key: SCRAPER_CONFIG_KEY },
-      update: {
-        value: {
-          schedule: input.schedule,
-          autoRunEnabled: input.autoRunEnabled
-        }
-      },
-      create: {
-        key: SCRAPER_CONFIG_KEY,
-        description: "Runtime configuration for scraper-service schedule",
-        value: {
-          schedule: input.schedule,
-          autoRunEnabled: input.autoRunEnabled
-        }
-      }
+    const currentConfig = await this.getCurrentConfig();
+    const nextConfig = this.normalizeConfig({
+      ...currentConfig,
+      schedule: input.schedule,
+      autoRunEnabled: input.autoRunEnabled,
+      enabledSources: input.enabledSources ?? currentConfig.enabledSources
     });
 
-    return {
-      schedule: applied.schedule,
-      autoRunEnabled: applied.autoRunEnabled,
-      updatedAt: setting.updatedAt,
-      source: "database"
-    };
+    return this.persistRuntimeConfig(nextConfig);
+  }
+
+  async updateSourceState(input: UpdateScraperAdminSourceStateInput): Promise<ScraperAdminConfig> {
+    const availableSources = this.getAvailableSourceCodes();
+
+    if (!availableSources.includes(input.sourceCode)) {
+      throw new BadGatewayException("Источник не доступен в текущем deploy-контуре");
+    }
+
+    const currentConfig = await this.getCurrentConfig();
+    const enabledSources = new Set(currentConfig.enabledSources);
+
+    if (input.isActive) {
+      enabledSources.add(input.sourceCode);
+    } else {
+      enabledSources.delete(input.sourceCode);
+    }
+
+    return this.persistRuntimeConfig({
+      ...currentConfig,
+      enabledSources: availableSources.filter((code) => enabledSources.has(code))
+    });
   }
 
   async getBootstrapConfig(): Promise<RuntimeConfigRecord> {
@@ -162,10 +179,14 @@ export class ScraperAdminService {
     });
 
     if (!setting) {
-      return this.getDefaultConfig();
+      const defaults = this.getDefaultConfig();
+      await this.syncSourceActivation(defaults.enabledSources);
+      return defaults;
     }
 
-    return this.normalizeConfig(setting.value);
+    const normalized = this.normalizeConfig(setting.value);
+    await this.syncSourceActivation(normalized.enabledSources);
+    return normalized;
   }
 
   private async getCurrentConfig(): Promise<ScraperAdminConfig> {
@@ -195,7 +216,8 @@ export class ScraperAdminService {
   private getDefaultConfig(): RuntimeConfigRecord {
     return {
       schedule: this.configService.get<string>("SCRAPE_SCHEDULE") ?? "*/20 * * * *",
-      autoRunEnabled: true
+      autoRunEnabled: true,
+      enabledSources: this.getAvailableSourceCodes()
     };
   }
 
@@ -203,17 +225,21 @@ export class ScraperAdminService {
     const defaults = this.getDefaultConfig();
     const raw =
       value && typeof value === "object" ? (value as Record<string, unknown>) : ({} as Record<string, unknown>);
+    const enabledSourcesRaw = Array.isArray(raw.enabledSources)
+      ? raw.enabledSources.filter((item): item is string => typeof item === "string")
+      : defaults.enabledSources;
 
     return {
       schedule: typeof raw.schedule === "string" && raw.schedule.trim().length > 0
         ? raw.schedule.trim()
         : defaults.schedule,
       autoRunEnabled:
-        typeof raw.autoRunEnabled === "boolean" ? raw.autoRunEnabled : defaults.autoRunEnabled
+        typeof raw.autoRunEnabled === "boolean" ? raw.autoRunEnabled : defaults.autoRunEnabled,
+      enabledSources: this.normalizeEnabledSources(enabledSourcesRaw)
     };
   }
 
-  private async fetchRuntimeState(): Promise<ScraperRuntimeState> {
+  private async fetchRuntimeState(fallbackConfig: RuntimeConfigRecord): Promise<ScraperRuntimeState> {
     const controlUrl =
       this.configService.get<string>("SCRAPER_CONTROL_URL") ?? "http://scraper-service:3001";
 
@@ -230,16 +256,18 @@ export class ScraperAdminService {
         running?: boolean;
         runningSources?: string[];
         loadedSources?: string[];
+        enabledSources?: string[];
         circuitStates?: Array<{ sourceCode: string; failures: number; openUntil?: string | null }>;
       };
 
       return {
         reachable: true,
-        schedule: payload.schedule ?? this.getDefaultConfig().schedule,
-        autoRunEnabled: payload.autoRunEnabled ?? true,
+        schedule: payload.schedule ?? fallbackConfig.schedule,
+        autoRunEnabled: payload.autoRunEnabled ?? fallbackConfig.autoRunEnabled,
         running: payload.running ?? false,
         runningSources: payload.runningSources ?? [],
-        loadedSources: payload.loadedSources ?? [],
+        loadedSources: this.normalizeEnabledSources(payload.loadedSources ?? fallbackConfig.enabledSources),
+        enabledSources: this.normalizeEnabledSources(payload.enabledSources ?? fallbackConfig.enabledSources),
         circuitStates: (payload.circuitStates ?? []).map((item) => ({
           sourceCode: item.sourceCode,
           failures: item.failures,
@@ -250,11 +278,12 @@ export class ScraperAdminService {
     } catch (error) {
       return {
         reachable: false,
-        schedule: this.getDefaultConfig().schedule,
-        autoRunEnabled: true,
+        schedule: fallbackConfig.schedule,
+        autoRunEnabled: fallbackConfig.autoRunEnabled,
         running: false,
         runningSources: [],
-        loadedSources: [],
+        loadedSources: fallbackConfig.enabledSources,
+        enabledSources: fallbackConfig.enabledSources,
         circuitStates: [],
         message:
           error instanceof Error
@@ -264,7 +293,7 @@ export class ScraperAdminService {
     }
   }
 
-  private async applyRuntimeConfig(input: UpdateScraperAdminConfigInput): Promise<RuntimeConfigRecord> {
+  private async applyRuntimeConfig(input: RuntimeConfigRecord): Promise<RuntimeConfigRecord> {
     const controlUrl =
       this.configService.get<string>("SCRAPER_CONTROL_URL") ?? "http://scraper-service:3001";
 
@@ -291,7 +320,81 @@ export class ScraperAdminService {
 
     return {
       schedule: payload.schedule,
-      autoRunEnabled: payload.autoRunEnabled
+      autoRunEnabled: payload.autoRunEnabled,
+      enabledSources: this.normalizeEnabledSources(payload.enabledSources)
     };
+  }
+
+  private getAvailableSourceCodes(): string[] {
+    const available = this.configService.get<string[]>("ENABLED_SOURCES") ?? [];
+    return [...new Set(available.map((item) => item.trim()).filter(Boolean))];
+  }
+
+  private normalizeEnabledSources(sourceCodes: string[]): string[] {
+    const requested = new Set(sourceCodes.map((item) => item.trim()).filter(Boolean));
+    return this.getAvailableSourceCodes().filter((code) => requested.has(code));
+  }
+
+  private async persistRuntimeConfig(nextConfig: RuntimeConfigRecord): Promise<ScraperAdminConfig> {
+    const applied = await this.applyRuntimeConfig(nextConfig);
+
+    const setting = await this.prisma.systemSetting.upsert({
+      where: { key: SCRAPER_CONFIG_KEY },
+      update: {
+        value: {
+          schedule: nextConfig.schedule,
+          autoRunEnabled: nextConfig.autoRunEnabled,
+          enabledSources: nextConfig.enabledSources
+        }
+      },
+      create: {
+        key: SCRAPER_CONFIG_KEY,
+        description: "Runtime configuration for scraper-service schedule",
+        value: {
+          schedule: nextConfig.schedule,
+          autoRunEnabled: nextConfig.autoRunEnabled,
+          enabledSources: nextConfig.enabledSources
+        }
+      }
+    });
+
+    await this.syncSourceActivation(applied.enabledSources);
+
+    return {
+      schedule: applied.schedule,
+      autoRunEnabled: applied.autoRunEnabled,
+      enabledSources: applied.enabledSources,
+      updatedAt: setting.updatedAt,
+      source: "database"
+    };
+  }
+
+  private async syncSourceActivation(enabledSources: string[]) {
+    const availableSources = this.getAvailableSourceCodes();
+
+    if (availableSources.length === 0) {
+      return;
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.source.updateMany({
+        where: {
+          code: { in: availableSources },
+          deletedAt: null
+        },
+        data: {
+          isActive: false
+        }
+      }),
+      this.prisma.source.updateMany({
+        where: {
+          code: { in: enabledSources },
+          deletedAt: null
+        },
+        data: {
+          isActive: true
+        }
+      })
+    ]);
   }
 }

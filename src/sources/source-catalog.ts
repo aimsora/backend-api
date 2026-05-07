@@ -92,7 +92,6 @@ export async function syncEnabledSourcesCatalog(
         description: item.description,
         kind: item.kind,
         baseUrl: item.baseUrl,
-        isActive: true,
         deletedAt: null
       },
       create: {
